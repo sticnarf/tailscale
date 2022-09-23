@@ -18,14 +18,12 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/coreos/go-iptables/iptables"
 	"github.com/tailscale/netlink"
 	"go4.org/netipx"
 	"golang.org/x/sys/unix"
 	"golang.org/x/time/rate"
 	"golang.zx2c4.com/wireguard/tun"
 	"tailscale.com/envknob"
-	"tailscale.com/net/tsaddr"
 	"tailscale.com/types/logger"
 	"tailscale.com/types/preftype"
 	"tailscale.com/util/multierr"
@@ -116,11 +114,6 @@ func newUserspaceRouter(logf logger.Logf, tunDev tun.Device, linkMon *monitor.Mo
 		return nil, err
 	}
 
-	ipt4, err := iptables.NewWithProtocol(iptables.ProtocolIPv4)
-	if err != nil {
-		return nil, err
-	}
-
 	v6err := checkIPv6(logf)
 	if v6err != nil {
 		logf("disabling tunneled IPv6 due to system IPv6 config: %v", v6err)
@@ -131,21 +124,11 @@ func newUserspaceRouter(logf logger.Logf, tunDev tun.Device, linkMon *monitor.Mo
 		logf("v6nat = %v", supportsV6NAT)
 	}
 
-	var ipt6 netfilterRunner
-	if supportsV6 {
-		// The iptables package probes for `ip6tables` and errors out
-		// if unavailable. We want that to be a non-fatal error.
-		ipt6, err = iptables.NewWithProtocol(iptables.ProtocolIPv6)
-		if err != nil {
-			return nil, err
-		}
-	}
-
 	cmd := osCommandRunner{
 		ambientCapNetAdmin: useAmbientCaps(),
 	}
 
-	return newUserspaceRouterAdvanced(logf, tunname, linkMon, ipt4, ipt6, cmd, supportsV6, supportsV6NAT)
+	return newUserspaceRouterAdvanced(logf, tunname, linkMon, nil, nil, cmd, supportsV6, supportsV6NAT)
 }
 
 func newUserspaceRouterAdvanced(logf logger.Logf, tunname string, linkMon *monitor.Mon, netfilter4, netfilter6 netfilterRunner, cmd commandRunner, supportsV6, supportsV6NAT bool) (Router, error) {
@@ -503,44 +486,12 @@ func (r *linuxRouter) delAddress(addr netip.Prefix) error {
 // addLoopbackRule adds a firewall rule to permit loopback traffic to
 // a local Tailscale IP.
 func (r *linuxRouter) addLoopbackRule(addr netip.Addr) error {
-	if r.netfilterMode == netfilterOff {
-		return nil
-	}
-
-	nf := r.ipt4
-	if addr.Is6() {
-		if !r.v6Available {
-			// IPv6 not available, ignore.
-			return nil
-		}
-		nf = r.ipt6
-	}
-
-	if err := nf.Insert("filter", "ts-input", 1, "-i", "lo", "-s", addr.String(), "-j", "ACCEPT"); err != nil {
-		return fmt.Errorf("adding loopback allow rule for %q: %w", addr, err)
-	}
 	return nil
 }
 
 // delLoopbackRule removes the firewall rule permitting loopback
 // traffic to a Tailscale IP.
 func (r *linuxRouter) delLoopbackRule(addr netip.Addr) error {
-	if r.netfilterMode == netfilterOff {
-		return nil
-	}
-
-	nf := r.ipt4
-	if addr.Is6() {
-		if !r.v6Available {
-			// IPv6 not available, ignore.
-			return nil
-		}
-		nf = r.ipt6
-	}
-
-	if err := nf.Delete("filter", "ts-input", "-i", "lo", "-s", addr.String(), "-j", "ACCEPT"); err != nil {
-		return fmt.Errorf("deleting loopback allow rule for %q: %w", addr, err)
-	}
 	return nil
 }
 
@@ -1059,42 +1010,11 @@ func (r *linuxRouter) delIPRulesWithIPCommand() error {
 }
 
 func (r *linuxRouter) netfilterFamilies() []netfilterRunner {
-	if r.v6Available {
-		return []netfilterRunner{r.ipt4, r.ipt6}
-	}
-	return []netfilterRunner{r.ipt4}
+	return []netfilterRunner{}
 }
 
 // addNetfilterChains creates custom Tailscale chains in netfilter.
 func (r *linuxRouter) addNetfilterChains() error {
-	create := func(ipt netfilterRunner, table, chain string) error {
-		err := ipt.ClearChain(table, chain)
-		if errCode(err) == 1 {
-			// nonexistent chain. let's create it!
-			return ipt.NewChain(table, chain)
-		}
-		if err != nil {
-			return fmt.Errorf("setting up %s/%s: %w", table, chain, err)
-		}
-		return nil
-	}
-
-	for _, ipt := range r.netfilterFamilies() {
-		if err := create(ipt, "filter", "ts-input"); err != nil {
-			return err
-		}
-		if err := create(ipt, "filter", "ts-forward"); err != nil {
-			return err
-		}
-	}
-	if err := create(r.ipt4, "nat", "ts-postrouting"); err != nil {
-		return err
-	}
-	if r.v6NATAvailable {
-		if err := create(r.ipt6, "nat", "ts-postrouting"); err != nil {
-			return err
-		}
-	}
 	return nil
 }
 
@@ -1115,49 +1035,6 @@ func (r *linuxRouter) addNetfilterBase() error {
 // addNetfilterBase4 adds some basic IPv4 processing rules to be
 // supplemented by later calls to other helpers.
 func (r *linuxRouter) addNetfilterBase4() error {
-	// Only allow CGNAT range traffic to come from tailscale0. There
-	// is an exception carved out for ranges used by ChromeOS, for
-	// which we fall out of the Tailscale chain.
-	//
-	// Note, this will definitely break nodes that end up using the
-	// CGNAT range for other purposes :(.
-	args := []string{"!", "-i", r.tunname, "-s", tsaddr.ChromeOSVMRange().String(), "-j", "RETURN"}
-	if err := r.ipt4.Append("filter", "ts-input", args...); err != nil {
-		return fmt.Errorf("adding %v in v4/filter/ts-input: %w", args, err)
-	}
-	args = []string{"!", "-i", r.tunname, "-s", tsaddr.CGNATRange().String(), "-j", "DROP"}
-	if err := r.ipt4.Append("filter", "ts-input", args...); err != nil {
-		return fmt.Errorf("adding %v in v4/filter/ts-input: %w", args, err)
-	}
-
-	// Forward all traffic from the Tailscale interface, and drop
-	// traffic to the tailscale interface by default. We use packet
-	// marks here so both filter/FORWARD and nat/POSTROUTING can match
-	// on these packets of interest.
-	//
-	// In particular, we only want to apply SNAT rules in
-	// nat/POSTROUTING to packets that originated from the Tailscale
-	// interface, but we can't match on the inbound interface in
-	// POSTROUTING. So instead, we match on the inbound interface in
-	// filter/FORWARD, and set a packet mark that nat/POSTROUTING can
-	// use to effectively run that same test again.
-	args = []string{"-i", r.tunname, "-j", "MARK", "--set-mark", tailscaleSubnetRouteMark}
-	if err := r.ipt4.Append("filter", "ts-forward", args...); err != nil {
-		return fmt.Errorf("adding %v in v4/filter/ts-forward: %w", args, err)
-	}
-	args = []string{"-m", "mark", "--mark", tailscaleSubnetRouteMark, "-j", "ACCEPT"}
-	if err := r.ipt4.Append("filter", "ts-forward", args...); err != nil {
-		return fmt.Errorf("adding %v in v4/filter/ts-forward: %w", args, err)
-	}
-	args = []string{"-o", r.tunname, "-s", tsaddr.CGNATRange().String(), "-j", "DROP"}
-	if err := r.ipt4.Append("filter", "ts-forward", args...); err != nil {
-		return fmt.Errorf("adding %v in v4/filter/ts-forward: %w", args, err)
-	}
-	args = []string{"-o", r.tunname, "-j", "ACCEPT"}
-	if err := r.ipt4.Append("filter", "ts-forward", args...); err != nil {
-		return fmt.Errorf("adding %v in v4/filter/ts-forward: %w", args, err)
-	}
-
 	return nil
 }
 
@@ -1187,75 +1064,12 @@ func (r *linuxRouter) addNetfilterBase6() error {
 
 // delNetfilterChains removes the custom Tailscale chains from netfilter.
 func (r *linuxRouter) delNetfilterChains() error {
-	del := func(ipt netfilterRunner, table, chain string) error {
-		if err := ipt.ClearChain(table, chain); err != nil {
-			if errCode(err) == 1 {
-				// nonexistent chain. That's fine, since it's
-				// the desired state anyway.
-				return nil
-			}
-			return fmt.Errorf("flushing %s/%s: %w", table, chain, err)
-		}
-		if err := ipt.DeleteChain(table, chain); err != nil {
-			// this shouldn't fail, because if the chain didn't
-			// exist, we would have returned after ClearChain.
-			return fmt.Errorf("deleting %s/%s: %v", table, chain, err)
-		}
-		return nil
-	}
-
-	for _, ipt := range r.netfilterFamilies() {
-		if err := del(ipt, "filter", "ts-input"); err != nil {
-			return err
-		}
-		if err := del(ipt, "filter", "ts-forward"); err != nil {
-			return err
-		}
-	}
-	if err := del(r.ipt4, "nat", "ts-postrouting"); err != nil {
-		return err
-	}
-	if r.v6NATAvailable {
-		if err := del(r.ipt6, "nat", "ts-postrouting"); err != nil {
-			return err
-		}
-	}
-
 	return nil
 }
 
 // delNetfilterBase empties but does not remove custom Tailscale chains from
 // netfilter.
 func (r *linuxRouter) delNetfilterBase() error {
-	del := func(ipt netfilterRunner, table, chain string) error {
-		if err := ipt.ClearChain(table, chain); err != nil {
-			if errCode(err) == 1 {
-				// nonexistent chain. That's fine, since it's
-				// the desired state anyway.
-				return nil
-			}
-			return fmt.Errorf("flushing %s/%s: %w", table, chain, err)
-		}
-		return nil
-	}
-
-	for _, ipt := range r.netfilterFamilies() {
-		if err := del(ipt, "filter", "ts-input"); err != nil {
-			return err
-		}
-		if err := del(ipt, "filter", "ts-forward"); err != nil {
-			return err
-		}
-	}
-	if err := del(r.ipt4, "nat", "ts-postrouting"); err != nil {
-		return err
-	}
-	if r.v6NATAvailable {
-		if err := del(r.ipt6, "nat", "ts-postrouting"); err != nil {
-			return err
-		}
-	}
-
 	return nil
 }
 
@@ -1263,114 +1077,24 @@ func (r *linuxRouter) delNetfilterBase() error {
 // the relevant main netfilter chains. The tailscale chains must
 // already exist.
 func (r *linuxRouter) addNetfilterHooks() error {
-	divert := func(ipt netfilterRunner, table, chain string) error {
-		tsChain := tsChain(chain)
-
-		args := []string{"-j", tsChain}
-		exists, err := ipt.Exists(table, chain, args...)
-		if err != nil {
-			return fmt.Errorf("checking for %v in %s/%s: %w", args, table, chain, err)
-		}
-		if exists {
-			return nil
-		}
-		if err := ipt.Insert(table, chain, 1, args...); err != nil {
-			return fmt.Errorf("adding %v in %s/%s: %w", args, table, chain, err)
-		}
-		return nil
-	}
-
-	for _, ipt := range r.netfilterFamilies() {
-		if err := divert(ipt, "filter", "INPUT"); err != nil {
-			return err
-		}
-		if err := divert(ipt, "filter", "FORWARD"); err != nil {
-			return err
-		}
-	}
-	if err := divert(r.ipt4, "nat", "POSTROUTING"); err != nil {
-		return err
-	}
-	if r.v6NATAvailable {
-		if err := divert(r.ipt6, "nat", "POSTROUTING"); err != nil {
-			return err
-		}
-	}
 	return nil
 }
 
 // delNetfilterHooks deletes the calls to tailscale's netfilter chains
 // in the relevant main netfilter chains.
 func (r *linuxRouter) delNetfilterHooks() error {
-	del := func(ipt netfilterRunner, table, chain string) error {
-		tsChain := tsChain(chain)
-		args := []string{"-j", tsChain}
-		if err := ipt.Delete(table, chain, args...); err != nil {
-			// TODO(apenwarr): check for errCode(1) here.
-			// Unfortunately the error code from the iptables
-			// module resists unwrapping, unlike with other
-			// calls. So we have to assume if Delete fails,
-			// it's because there is no such rule.
-			r.logf("note: deleting %v in %s/%s: %w", args, table, chain, err)
-			return nil
-		}
-		return nil
-	}
-
-	for _, ipt := range r.netfilterFamilies() {
-		if err := del(ipt, "filter", "INPUT"); err != nil {
-			return err
-		}
-		if err := del(ipt, "filter", "FORWARD"); err != nil {
-			return err
-		}
-	}
-	if err := del(r.ipt4, "nat", "POSTROUTING"); err != nil {
-		return err
-	}
-	if r.v6NATAvailable {
-		if err := del(r.ipt6, "nat", "POSTROUTING"); err != nil {
-			return err
-		}
-	}
 	return nil
 }
 
 // addSNATRule adds a netfilter rule to SNAT traffic destined for
 // local subnets.
 func (r *linuxRouter) addSNATRule() error {
-	if r.netfilterMode == netfilterOff {
-		return nil
-	}
-
-	args := []string{"-m", "mark", "--mark", tailscaleSubnetRouteMark, "-j", "MASQUERADE"}
-	if err := r.ipt4.Append("nat", "ts-postrouting", args...); err != nil {
-		return fmt.Errorf("adding %v in v4/nat/ts-postrouting: %w", args, err)
-	}
-	if r.v6NATAvailable {
-		if err := r.ipt6.Append("nat", "ts-postrouting", args...); err != nil {
-			return fmt.Errorf("adding %v in v6/nat/ts-postrouting: %w", args, err)
-		}
-	}
 	return nil
 }
 
 // delSNATRule removes the netfilter rule to SNAT traffic destined for
 // local subnets. Fails if the rule does not exist.
 func (r *linuxRouter) delSNATRule() error {
-	if r.netfilterMode == netfilterOff {
-		return nil
-	}
-
-	args := []string{"-m", "mark", "--mark", tailscaleSubnetRouteMark, "-j", "MASQUERADE"}
-	if err := r.ipt4.Delete("nat", "ts-postrouting", args...); err != nil {
-		return fmt.Errorf("deleting %v in v4/nat/ts-postrouting: %w", args, err)
-	}
-	if r.v6NATAvailable {
-		if err := r.ipt6.Delete("nat", "ts-postrouting", args...); err != nil {
-			return fmt.Errorf("deleting %v in v6/nat/ts-postrouting: %w", args, err)
-		}
-	}
 	return nil
 }
 
